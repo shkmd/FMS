@@ -15,6 +15,9 @@ COPY --from=deps /repo/packages/shared/node_modules ./packages/shared/node_modul
 COPY --from=deps /repo/apps/web/node_modules ./apps/web/node_modules
 COPY packages/shared packages/shared
 COPY apps/web apps/web
+# @fms/shared's package.json points at ./dist, which only exists after this — apps/web imports
+# the package by name, not by source path, so skipping it breaks module resolution at build time.
+RUN pnpm --filter @fms/shared build
 WORKDIR /repo/apps/web
 ENV NEXT_TELEMETRY_DISABLED=1
 # NEXT_PUBLIC_* vars are inlined into the client bundle at build time, so they must arrive as a

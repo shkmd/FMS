@@ -15,6 +15,9 @@ COPY --from=deps /repo/packages/shared/node_modules ./packages/shared/node_modul
 COPY --from=deps /repo/apps/api/node_modules ./apps/api/node_modules
 COPY packages/shared packages/shared
 COPY apps/api apps/api
+# @fms/shared's package.json points at ./dist, which only exists after this — apps/api imports
+# the package by name, not by source path, so skipping it breaks module resolution at build time.
+RUN pnpm --filter @fms/shared build
 WORKDIR /repo/apps/api
 # `prisma generate` only reads the schema (no DB connection), but Prisma still requires
 # DATABASE_URL to resolve to a non-empty string — the placeholder is never actually connected to.
