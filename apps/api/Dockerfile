@@ -9,6 +9,8 @@ COPY apps/api/package.json apps/api/package.json
 RUN pnpm install --frozen-lockfile --filter @fms/api...
 
 FROM base AS build
+# Prisma's engine binaries are native and dynamically link libssl — Alpine ships neither by default.
+RUN apk add --no-cache openssl
 COPY --from=deps /repo/pnpm-workspace.yaml /repo/package.json ./
 COPY --from=deps /repo/node_modules ./node_modules
 COPY --from=deps /repo/packages/shared/node_modules ./packages/shared/node_modules
@@ -28,6 +30,8 @@ RUN pnpm build
 
 FROM node:20-alpine AS runner
 RUN corepack enable
+# `prisma migrate deploy` (run as the pre-deploy step) needs its native engine binary to load libssl.
+RUN apk add --no-cache openssl
 WORKDIR /repo
 ENV NODE_ENV=production
 COPY --from=build /repo/node_modules ./node_modules
