@@ -9,6 +9,7 @@ COPY apps/web/package.json apps/web/package.json
 RUN pnpm install --frozen-lockfile --filter @fms/web...
 
 FROM base AS build
+COPY --from=deps /repo/pnpm-workspace.yaml /repo/package.json ./
 COPY --from=deps /repo/node_modules ./node_modules
 COPY --from=deps /repo/packages/shared/node_modules ./packages/shared/node_modules
 COPY --from=deps /repo/apps/web/node_modules ./apps/web/node_modules
