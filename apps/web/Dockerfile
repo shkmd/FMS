@@ -27,13 +27,17 @@ ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 RUN pnpm build
 
 FROM node:20-alpine AS runner
-WORKDIR /repo/apps/web
+WORKDIR /repo
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
-COPY --from=build /repo/apps/web/public ./public
-COPY --from=build /repo/apps/web/.next ./.next
-COPY --from=build /repo/apps/web/node_modules ./node_modules
-COPY --from=build /repo/apps/web/package.json ./package.json
+# pnpm's node_modules is a symlink farm into this root store — apps/web/node_modules alone is a
+# tree of dangling symlinks without it.
+COPY --from=build /repo/node_modules ./node_modules
+COPY --from=build /repo/apps/web/node_modules ./apps/web/node_modules
+COPY --from=build /repo/apps/web/public ./apps/web/public
+COPY --from=build /repo/apps/web/.next ./apps/web/.next
+COPY --from=build /repo/apps/web/package.json ./apps/web/package.json
+WORKDIR /repo/apps/web
 EXPOSE 3000
 # Runs `next start` directly (no pnpm) — the runner has no pnpm-workspace.yaml, and everything
 # `pnpm start` would do (resolve the script, invoke the local `next` binary) is already resolved.
