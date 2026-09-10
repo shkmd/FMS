@@ -8,7 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
-export default function ResetPasswordPage() {
+function ResetPasswordForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const tokenFromUrl = searchParams.get("token") ?? "";
@@ -78,5 +78,15 @@ export default function ResetPasswordPage() {
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+// useSearchParams() opts the page out of static rendering unless wrapped in Suspense — without
+// this, `next build` fails to prerender the page at all.
+export default function ResetPasswordPage() {
+  return (
+    <React.Suspense fallback={null}>
+      <ResetPasswordForm />
+    </React.Suspense>
   );
 }
