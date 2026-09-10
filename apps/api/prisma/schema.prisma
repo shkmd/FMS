@@ -1,0 +1,2184 @@
+// Athachi Farms FMS — full domain schema (spec §12).
+// Design notes (see docs/erd.md for the full rationale):
+// - Every operational table carries farmId + createdById/createdAt/updatedById/updatedAt + deletedAt
+//   (soft delete), per spec §12. Domain-specific status enums stand in for a generic "status" column.
+// - farmId is a real Prisma relation (single target, no naming collision). createdById/updatedById are
+//   PLAIN SCALAR references to User.id (no Prisma relation) — with ~60 tables each needing two links to
+//   User, modelling them as named relations would force ~120 back-relation arrays onto the User model
+//   for no behavioural benefit. They're still indexed and enforced at the application layer.
+// - Milestone 1 (auth/RBAC, farm structure, tasks, labour/reassignment, attendance) has full
+//   service-layer business logic. Every other module below is schema-complete and ready to attach a
+//   NestJS module to in a later pass, per the approved plan.
+// - PostGIS is deferred to Phase 3; spatial data uses plain Json (GeoJSON) / Float lat-lng for now.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =========================================================================
+// Identity, RBAC, Audit
+// =========================================================================
+
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+  SUSPENDED
+}
+
+model User {
+  id            String     @id @default(uuid())
+  email         String     @unique
+  phone         String?
+  passwordHash  String
+  name          String
+  avatarMediaId String?
+  status        UserStatus @default(ACTIVE)
+  lastLoginAt   DateTime?
+  employee      Employee?
+
+  roles         UserRole[]
+  areaAccess    UserAreaAccess[]
+  refreshTokens RefreshToken[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@index([status])
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  tokenHash String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model Role {
+  id          String  @id @default(uuid())
+  code        String  @unique
+  name        String
+  description String?
+  isSystem    Boolean @default(false)
+
+  permissions RolePermission[]
+  users       UserRole[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Permission {
+  id          String  @id @default(uuid())
+  code        String  @unique
+  module      String
+  description String?
+
+  roles RolePermission[]
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+model UserRole {
+  userId String
+  roleId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role   @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, roleId])
+}
+
+// Scopes a user (typically a supervisor) to specific farm areas for row-level access control.
+model UserAreaAccess {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  farmAreaId String
+  farmArea   FarmArea @relation(fields: [farmAreaId], references: [id], onDelete: Cascade)
+  createdAt  DateTime @default(now())
+
+  @@unique([userId, farmAreaId])
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  entityType String
+  entityId   String
+  action     String
+  beforeJson Json?
+  afterJson  Json?
+  userId     String?
+  farmId     String?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([userId])
+  @@index([createdAt])
+}
+
+// =========================================================================
+// Farm structure & GIS
+// =========================================================================
+
+model Farm {
+  id        String  @id @default(uuid())
+  name      String
+  code      String  @unique
+  totalArea Float?
+  areaUnit  String  @default("acre")
+  address   String?
+  timezone  String  @default("Asia/Kolkata")
+
+  farmAreas FarmArea[]
+  plots     Plot[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+}
+
+enum FarmAreaType {
+  PLOT
+  GARDEN_ZONE
+  NURSERY
+  RAIN_SHELTER
+  DAIRY
+  LIVESTOCK
+  STORE
+  PROCESSING_UNIT
+  APIARY
+  OTHER
+}
+
+enum FarmAreaStatus {
+  ACTIVE
+  FALLOW
+  UNDER_PREPARATION
+  ISSUE
+  INACTIVE
+}
+
+model FarmArea {
+  id               String         @id @default(uuid())
+  farmId           String
+  farm             Farm           @relation(fields: [farmId], references: [id])
+  name             String
+  code             String
+  type             FarmAreaType
+  areaSize         Float?
+  areaUnit         String         @default("acre")
+  boundary         Json?
+  centerLat        Float?
+  centerLng        Float?
+  soilType         String?
+  irrigationMethod String?
+  currentCropId    String?
+  supervisorId     String?
+  status           FarmAreaStatus @default(ACTIVE)
+  description      String?
+
+  plots          Plot[]
+  userAccess     UserAreaAccess[]
+  stockLocations StockLocation[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@unique([farmId, code])
+}
+
+model Plot {
+  id               String         @id @default(uuid())
+  farmId           String
+  farm             Farm           @relation(fields: [farmId], references: [id])
+  farmAreaId       String?
+  farmArea         FarmArea?      @relation(fields: [farmAreaId], references: [id])
+  code             String
+  name             String
+  totalArea        Float?
+  areaUnit         String         @default("acre")
+  soilType         String?
+  irrigationMethod String?
+  supervisorId     String?
+  boundary         Json?
+  centerLat        Float?
+  centerLng        Float?
+  status           FarmAreaStatus @default(ACTIVE)
+
+  subPlots          SubPlot[]
+  cultivationBlocks CultivationBlock[]
+  soilTests         SoilTest[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@unique([farmId, code])
+}
+
+model SubPlot {
+  id                 String         @id @default(uuid())
+  plotId             String
+  plot               Plot           @relation(fields: [plotId], references: [id])
+  code               String
+  name               String
+  area               Float?
+  areaUnit           String         @default("acre")
+  boundary           Json?
+  status             FarmAreaStatus @default(ACTIVE)
+  currentCropCycleId String?
+
+  cultivationBlocks CultivationBlock[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@unique([plotId, code])
+}
+
+model CultivationBlock {
+  id        String         @id @default(uuid())
+  plotId    String
+  plot      Plot           @relation(fields: [plotId], references: [id])
+  subPlotId String?
+  subPlot   SubPlot?       @relation(fields: [subPlotId], references: [id])
+  code      String
+  name      String
+  area      Float?
+  areaUnit  String         @default("acre")
+  status    FarmAreaStatus @default(ACTIVE)
+
+  cropCycles     CropCycle[]
+  harvestBatches HarvestBatch[]
+  rAndDTrials    RAndDTrial[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+}
+
+// =========================================================================
+// Crops, crop calendar, cultivation cycles
+// =========================================================================
+
+enum CropCategory {
+  RICE
+  VEGETABLE
+  SPICE
+  FRUIT
+  FLORICULTURE
+  HERB
+  OTHER
+}
+
+model Crop {
+  id          String       @id @default(uuid())
+  name        String
+  category    CropCategory
+  description String?
+
+  varieties     CropVariety[]
+  cropCalendars CropCalendar[]
+  cropCycles    CropCycle[]
+  rAndDTrials   RAndDTrial[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@unique([name])
+}
+
+enum VarietyClassification {
+  NATIVE
+  EXPERIMENTAL
+  COMMERCIAL
+}
+
+model CropVariety {
+  id             String                @id @default(uuid())
+  cropId         String
+  crop           Crop                  @relation(fields: [cropId], references: [id])
+  name           String
+  classification VarietyClassification
+  daysToMaturity Int?
+  description    String?
+
+  cropCalendars  CropCalendar[]
+  cropCycles     CropCycle[]
+  seedLots       SeedLot[]
+  nurseryBatches NurseryBatch[]
+  rAndDTrials    RAndDTrial[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  @@unique([cropId, name])
+}
+
+model CropCalendar {
+  id                         String       @id @default(uuid())
+  cropId                     String
+  crop                       Crop         @relation(fields: [cropId], references: [id])
+  varietyId                  String?
+  variety                    CropVariety? @relation(fields: [varietyId], references: [id])
+  season                     String
+  nurseryPeriodDays          Int?
+  sowingWindowStart          String
+  sowingWindowEnd            String
+  transplantingWindowStart   String?
+  transplantingWindowEnd     String?
+  irrigationSchedule         String?
+  manuringSchedule           String?
+  pestControlSchedule        String?
+  expectedGrowthStages       Json?
+  expectedHarvestWindowStart String?
+  expectedHarvestWindowEnd   String?
+  expectedYieldPerUnitArea   Float?
+  requiredLabourNotes        String?
+  requiredInputsNotes        String?
+
+  activities CropActivity[]
+  cropCycles CropCycle[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+}
+
+model CropActivity {
+  id             String       @id @default(uuid())
+  cropCalendarId String
+  cropCalendar   CropCalendar @relation(fields: [cropCalendarId], references: [id])
+  stageName      String
+  dayOffset      Int
+  activityName   String
+  description    String?
+  inputsNeeded   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum CropCycleStage {
+  PLANNED
+  LAND_PREPARATION
+  SEED_SELECTION
+  SOWING
+  GERMINATION
+  NURSERY
+  TRANSPLANTING
+  VEGETATIVE_GROWTH
+  FLOWERING
+  FRUITING
+  HARVEST_READY
+  HARVESTED
+  CLOSED
+}
+
+model CropCycle {
+  id                      String           @id @default(uuid())
+  farmId                  String
+  cultivationBlockId      String
+  cultivationBlock        CultivationBlock @relation(fields: [cultivationBlockId], references: [id])
+  cropId                  String
+  crop                    Crop             @relation(fields: [cropId], references: [id])
+  varietyId               String?
+  variety                 CropVariety?     @relation(fields: [varietyId], references: [id])
+  cropCalendarId          String?
+  cropCalendar            CropCalendar?    @relation(fields: [cropCalendarId], references: [id])
+  stage                   CropCycleStage   @default(PLANNED)
+  sownDate                DateTime?
+  transplantDate          DateTime?
+  expectedHarvestStart    DateTime?
+  expectedHarvestEnd      DateTime?
+  expectedYield           Float?
+  actualYield             Float?
+  yieldUnit               String?          @default("kg")
+  isOutOfSeason           Boolean          @default(false)
+  outOfSeasonApprovedById String?
+  outOfSeasonReason       String?
+
+  tasks              Task[]
+  harvestForecasts   HarvestForecast[]
+  harvestBatches     HarvestBatch[]
+  plantHealthRecords PlantHealthRecord[]
+  pestTreatments     PestTreatment[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@index([cultivationBlockId])
+  @@index([stage])
+}
+
+// =========================================================================
+// Workforce
+// =========================================================================
+
+enum EmploymentCategory {
+  PERMANENT
+  CONTRACT
+  DAILY_WAGE
+  SEASONAL
+  EXTERNAL
+}
+
+model Employee {
+  id                 String             @id @default(uuid())
+  farmId             String
+  userId             String?            @unique
+  user               User?              @relation(fields: [userId], references: [id])
+  employeeCode       String             @unique
+  name               String
+  phone              String?
+  departmentId       String?
+  department         Department?        @relation(fields: [departmentId], references: [id])
+  designationId      String?
+  designation        Designation?       @relation(fields: [designationId], references: [id])
+  employmentCategory EmploymentCategory
+  joinDate           DateTime?
+  photoMediaId       String?
+  status             UserStatus         @default(ACTIVE)
+
+  worker Worker?
+
+  jobApplication      JobApplication?
+  trainingEnrollments TrainingEnrollment[]
+  onboarding          OnboardingCase?
+  offboarding         OffboardingCase?
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@index([farmId])
+  @@index([departmentId])
+  @@index([designationId])
+}
+
+model Skill {
+  id          String  @id @default(uuid())
+  name        String  @unique
+  description String?
+
+  workers WorkerSkill[]
+}
+
+model Worker {
+  id               String   @id @default(uuid())
+  employeeId       String   @unique
+  employee         Employee @relation(fields: [employeeId], references: [id])
+  availability     Boolean  @default(true)
+  workRestrictions String?
+
+  skills            WorkerSkill[]
+  taskAssignments   TaskAssignment[]
+  attendanceRecords Attendance[]
+  reassignmentsFrom ReassignmentRequest[] @relation("ReassignmentWorker")
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+}
+
+model WorkerSkill {
+  workerId    String
+  skillId     String
+  worker      Worker  @relation(fields: [workerId], references: [id], onDelete: Cascade)
+  skill       Skill   @relation(fields: [skillId], references: [id], onDelete: Cascade)
+  proficiency String? // basic / skilled / expert
+
+  @@id([workerId, skillId])
+}
+
+enum AttendanceMethod {
+  BIOMETRIC
+  MANUAL
+  PHOTO
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  HALF_DAY
+  ON_LEAVE
+  OVERTIME
+}
+
+model Attendance {
+  id                     String           @id @default(uuid())
+  farmId                 String
+  workerId               String
+  worker                 Worker           @relation(fields: [workerId], references: [id])
+  date                   DateTime         @db.Date
+  checkInAt              DateTime?
+  checkOutAt             DateTime?
+  method                 AttendanceMethod @default(MANUAL)
+  status                 AttendanceStatus @default(PRESENT)
+  farmAreaId             String?
+  photoMediaId           String?
+  lateMinutes            Int?             @default(0)
+  overtimeMinutes        Int?             @default(0)
+  correctionOfId         String?
+  correctionReason       String?
+  correctionApprovedById String?
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@unique([workerId, date])
+  @@index([date])
+}
+
+// =========================================================================
+// Workforce — HR administration (departments, designations, recruitment,
+// learning, onboarding, offboarding)
+// =========================================================================
+
+model Department {
+  id          String  @id @default(uuid())
+  farmId      String
+  name        String
+  code        String  @unique
+  description String?
+
+  designations Designation[]
+  employees    Employee[]
+  requisitions JobRequisition[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@index([farmId])
+}
+
+model Designation {
+  id           String      @id @default(uuid())
+  farmId       String
+  title        String
+  code         String      @unique
+  departmentId String?
+  department   Department? @relation(fields: [departmentId], references: [id])
+  grade        String?
+  description  String?
+
+  employees    Employee[]
+  requisitions JobRequisition[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@index([farmId])
+  @@index([departmentId])
+}
+
+enum RequisitionStatus {
+  OPEN
+  IN_PROGRESS
+  ON_HOLD
+  CLOSED
+  CANCELLED
+}
+
+enum ApplicationStage {
+  APPLIED
+  SCREENING
+  INTERVIEW
+  OFFER
+  HIRED
+  REJECTED
+  WITHDRAWN
+}
+
+model JobRequisition {
+  id             String            @id @default(uuid())
+  farmId         String
+  title          String
+  departmentId   String?
+  department     Department?       @relation(fields: [departmentId], references: [id])
+  designationId  String?
+  designation    Designation?      @relation(fields: [designationId], references: [id])
+  openings       Int               @default(1)
+  status         RequisitionStatus @default(OPEN)
+  description    String?
+  targetJoinDate DateTime?
+
+  applications JobApplication[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@index([farmId])
+  @@index([status])
+}
+
+model JobApplication {
+  id              String           @id @default(uuid())
+  requisitionId   String
+  requisition     JobRequisition   @relation(fields: [requisitionId], references: [id])
+  candidateName   String
+  phone           String?
+  email           String?
+  stage           ApplicationStage @default(APPLIED)
+  notes           String?
+  appliedDate     DateTime         @default(now())
+  hiredEmployeeId String?          @unique
+  hiredEmployee   Employee?        @relation(fields: [hiredEmployeeId], references: [id])
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@index([requisitionId])
+  @@index([stage])
+}
+
+enum TrainingSessionStatus {
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+}
+
+enum EnrollmentStatus {
+  ENROLLED
+  COMPLETED
+  NO_SHOW
+  CANCELLED
+}
+
+model TrainingProgram {
+  id          String  @id @default(uuid())
+  farmId      String
+  title       String
+  category    String?
+  description String?
+
+  sessions TrainingSession[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@index([farmId])
+}
+
+model TrainingSession {
+  id            String                @id @default(uuid())
+  programId     String
+  program       TrainingProgram       @relation(fields: [programId], references: [id])
+  trainer       String?
+  location      String?
+  scheduledDate DateTime
+  status        TrainingSessionStatus @default(SCHEDULED)
+
+  enrollments TrainingEnrollment[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@index([programId])
+}
+
+model TrainingEnrollment {
+  id         String           @id @default(uuid())
+  sessionId  String
+  session    TrainingSession  @relation(fields: [sessionId], references: [id])
+  employeeId String
+  employee   Employee         @relation(fields: [employeeId], references: [id])
+  status     EnrollmentStatus @default(ENROLLED)
+  score      Float?
+  feedback   String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([sessionId, employeeId])
+  @@index([employeeId])
+}
+
+enum ChecklistTaskStatus {
+  PENDING
+  IN_PROGRESS
+  DONE
+}
+
+enum OffboardingReason {
+  RESIGNATION
+  TERMINATION
+  CONTRACT_END
+  RETIREMENT
+  OTHER
+}
+
+enum HrCaseStatus {
+  IN_PROGRESS
+  COMPLETED
+}
+
+model OnboardingCase {
+  id          String       @id @default(uuid())
+  employeeId  String       @unique
+  employee    Employee     @relation(fields: [employeeId], references: [id])
+  startDate   DateTime
+  status      HrCaseStatus @default(IN_PROGRESS)
+  completedAt DateTime?
+
+  tasks OnboardingTask[]
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([employeeId])
+}
+
+model OnboardingTask {
+  id           String              @id @default(uuid())
+  caseId       String
+  case         OnboardingCase      @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  title        String
+  assignedToId String?
+  dueDate      DateTime?
+  status       ChecklistTaskStatus @default(PENDING)
+  completedAt  DateTime?
+
+  @@index([caseId])
+}
+
+model OffboardingCase {
+  id             String            @id @default(uuid())
+  employeeId     String            @unique
+  employee       Employee          @relation(fields: [employeeId], references: [id])
+  reason         OffboardingReason
+  lastWorkingDay DateTime
+  notes          String?
+  status         HrCaseStatus      @default(IN_PROGRESS)
+  completedAt    DateTime?
+
+  tasks OffboardingTask[]
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([employeeId])
+}
+
+model OffboardingTask {
+  id           String              @id @default(uuid())
+  caseId       String
+  case         OffboardingCase     @relation(fields: [caseId], references: [id], onDelete: Cascade)
+  title        String
+  assignedToId String?
+  dueDate      DateTime?
+  status       ChecklistTaskStatus @default(PENDING)
+  completedAt  DateTime?
+
+  @@index([caseId])
+}
+
+// =========================================================================
+// Daily planning & task management (Milestone 1 core)
+// =========================================================================
+
+enum TaskPriority {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum TaskStatus {
+  DRAFT
+  SUBMITTED
+  APPROVED
+  ASSIGNED
+  IN_PROGRESS
+  PAUSED
+  BLOCKED
+  COMPLETED
+  VERIFIED
+  CANCELLED
+  CARRIED_FORWARD
+}
+
+model Task {
+  id                   String       @id @default(uuid())
+  farmId               String
+  taskNumber           String       @unique
+  date                 DateTime     @db.Date
+  farmAreaId           String
+  plotId               String?
+  subPlotId            String?
+  cropCycleId          String?
+  cropCycle            CropCycle?   @relation(fields: [cropCycleId], references: [id])
+  category             String
+  description          String?
+  priority             TaskPriority @default(MEDIUM)
+  requestedWorkers     Int          @default(1)
+  requiredSkills       String[]
+  plannedStart         DateTime?
+  plannedEnd           DateTime?
+  expectedOutput       String?
+  requiredInputsNotes  String?
+  assignedSupervisorId String?
+  safetyNotes          String?
+  status               TaskStatus   @default(DRAFT)
+  approvedById         String?
+  approvedAt           DateTime?
+  requiresEvidence     Boolean      @default(false)
+  carriedForwardFromId String?      @unique
+  carriedForwardReason String?
+
+  dependsOn         TaskDependency[]      @relation("DependentTask")
+  dependedOnBy      TaskDependency[]      @relation("PrerequisiteTask")
+  assignments       TaskAssignment[]
+  progressLogs      TaskProgress[]
+  evidence          TaskEvidence[]
+  machinery         TaskMachinery[]
+  labourRequests    LabourRequest[]
+  reassignmentsFrom ReassignmentRequest[] @relation("ReassignmentFromTask")
+  reassignmentsTo   ReassignmentRequest[] @relation("ReassignmentToTask")
+  comments          Comment[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  @@index([farmId, date])
+  @@index([status])
+  @@index([farmAreaId])
+}
+
+model TaskDependency {
+  id                 String @id @default(uuid())
+  dependentTaskId    String
+  dependentTask      Task   @relation("DependentTask", fields: [dependentTaskId], references: [id], onDelete: Cascade)
+  prerequisiteTaskId String
+  prerequisiteTask   Task   @relation("PrerequisiteTask", fields: [prerequisiteTaskId], references: [id], onDelete: Cascade)
+
+  @@unique([dependentTaskId, prerequisiteTaskId])
+}
+
+model TaskMachinery {
+  id      String @id @default(uuid())
+  taskId  String
+  task    Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  assetId String
+  asset   Asset  @relation(fields: [assetId], references: [id])
+
+  @@unique([taskId, assetId])
+}
+
+model TaskAssignment {
+  id           String    @id @default(uuid())
+  taskId       String
+  task         Task      @relation(fields: [taskId], references: [id])
+  workerId     String
+  worker       Worker    @relation(fields: [workerId], references: [id])
+  assignedById String
+  assignedAt   DateTime  @default(now())
+  unassignedAt DateTime?
+  isActive     Boolean   @default(true)
+  roleOnTask   String?
+  hoursPlanned Float?
+  hoursActual  Float?
+  notes        String?
+
+  @@index([workerId, isActive])
+  @@index([taskId])
+}
+
+model TaskProgress {
+  id                String      @id @default(uuid())
+  taskId            String
+  task              Task        @relation(fields: [taskId], references: [id])
+  recordedById      String
+  recordedAt        DateTime    @default(now())
+  statusFrom        TaskStatus?
+  statusTo          TaskStatus
+  quantityCompleted Float?
+  unit              String?
+  notes             String?
+  gpsLat            Float?
+  gpsLng            Float?
+
+  @@index([taskId])
+}
+
+model TaskEvidence {
+  id           String   @id @default(uuid())
+  taskId       String
+  task         Task     @relation(fields: [taskId], references: [id])
+  mediaFileId  String
+  uploadedById String
+  uploadedAt   DateTime @default(now())
+  caption      String?
+
+  @@index([taskId])
+}
+
+enum RequestUrgency {
+  LOW
+  NORMAL
+  URGENT
+}
+
+enum LabourRequestStatus {
+  PENDING
+  PARTIALLY_FULFILLED
+  FULFILLED
+  CANCELLED
+}
+
+// Mid-day / ad-hoc request for additional hands on an existing task (distinct from ReassignmentRequest,
+// which moves an already-assigned worker).
+model LabourRequest {
+  id             String              @id @default(uuid())
+  farmId         String
+  taskId         String
+  task           Task                @relation(fields: [taskId], references: [id])
+  requestedById  String
+  requestedCount Int
+  skillsNeeded   String[]
+  urgency        RequestUrgency      @default(NORMAL)
+  status         LabourRequestStatus @default(PENDING)
+  fulfilledCount Int                 @default(0)
+  notes          String?
+  decidedById    String?
+  decidedAt      DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum ReassignmentStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum ReassignmentEffect {
+  PAUSED
+  TRANSFERRED
+  COMPLETED_PARTIAL
+}
+
+model ReassignmentRequest {
+  id                   String              @id @default(uuid())
+  farmId               String
+  workerId             String
+  worker               Worker              @relation("ReassignmentWorker", fields: [workerId], references: [id])
+  fromTaskId           String
+  fromTask             Task                @relation("ReassignmentFromTask", fields: [fromTaskId], references: [id])
+  toTaskId             String
+  toTask               Task                @relation("ReassignmentToTask", fields: [toTaskId], references: [id])
+  reason               String
+  urgency              RequestUrgency      @default(NORMAL)
+  requestedById        String
+  approverId           String?
+  status               ReassignmentStatus  @default(PENDING)
+  effectOnOriginalTask ReassignmentEffect?
+  replacementWorkerId  String?
+  decidedAt            DateTime?
+  notes                String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([workerId])
+}
+
+// =========================================================================
+// Inspections, issues, corrective actions
+// =========================================================================
+
+enum IssueSeverity {
+  OBSERVATION
+  MINOR
+  MAJOR
+  CRITICAL
+}
+
+enum IssueStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  ESCALATED
+  CLOSED
+}
+
+model Inspection {
+  id          String   @id @default(uuid())
+  farmId      String
+  farmAreaId  String
+  inspectorId String
+  date        DateTime @default(now())
+  type        String?
+  notes       String?
+
+  issues Issue[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Issue {
+  id                 String        @id @default(uuid())
+  farmId             String
+  inspectionId       String?
+  inspection         Inspection?   @relation(fields: [inspectionId], references: [id])
+  farmAreaId         String
+  plotId             String?
+  category           String
+  severity           IssueSeverity
+  description        String
+  reportedById       String
+  assignedToId       String?
+  dueDate            DateTime?
+  recommendedAction  String?
+  status             IssueStatus   @default(OPEN)
+  resolutionEvidence String?
+  verifiedById       String?
+  escalatedAt        DateTime?
+  escalatedToId      String?
+
+  correctiveActions CorrectiveAction[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([severity])
+}
+
+model CorrectiveAction {
+  id              String   @id @default(uuid())
+  issueId         String
+  issue           Issue    @relation(fields: [issueId], references: [id])
+  description     String
+  actionById      String
+  actionDate      DateTime @default(now())
+  evidenceMediaId String?
+  result          String?
+
+  createdAt DateTime @default(now())
+}
+
+// =========================================================================
+// Nursery, seed storage, germination
+// =========================================================================
+
+model SeedLot {
+  id                   String                @id @default(uuid())
+  farmId               String
+  lotNumber            String                @unique
+  cropId               String
+  varietyId            String
+  variety              CropVariety           @relation(fields: [varietyId], references: [id])
+  classification       VarietyClassification
+  source               String?
+  procurementDate      DateTime?
+  quantity             Float
+  unit                 String                @default("kg")
+  storageLocationId    String?
+  container            String?
+  storageTemperature   Float?
+  storageHumidity      Float?
+  expiryDate           DateTime?
+  initialQualityNotes  String?
+  certificationDetails String?
+  photoMediaId         String?
+  currentBalance       Float
+
+  storageReadings   SeedStorageReading[]
+  germinationTrials GerminationTrial[]
+  nurseryBatches    NurseryBatch[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+}
+
+model SeedStorageReading {
+  id           String   @id @default(uuid())
+  seedLotId    String
+  seedLot      SeedLot  @relation(fields: [seedLotId], references: [id])
+  readingAt    DateTime @default(now())
+  temperature  Float?
+  humidity     Float?
+  recordedById String
+  notes        String?
+}
+
+model GerminationTrial {
+  id                 String   @id @default(uuid())
+  seedLotId          String
+  seedLot            SeedLot  @relation(fields: [seedLotId], references: [id])
+  trialDate          DateTime @default(now())
+  seedsTested        Int
+  seedsGerminated    Int
+  growingMedium      String?
+  temperature        Float?
+  moistureConditions String?
+  staffId            String
+  photoMediaId       String?
+  observations       String?
+  correctiveAction   String?
+  approvedForSowing  Boolean  @default(false)
+  rejected           Boolean  @default(false)
+  quarantined        Boolean  @default(false)
+
+  nurseryBatches NurseryBatch[]
+
+  createdAt DateTime @default(now())
+}
+
+enum NurseryStage {
+  SEED_TRAY
+  SMALL_GROW_BAG
+  LARGE_GROW_BAG
+  RAIN_SHELTER
+  READY_FOR_FIELD
+}
+
+model NurseryBatch {
+  id                 String            @id @default(uuid())
+  farmId             String
+  seedLotId          String?
+  seedLot            SeedLot?          @relation(fields: [seedLotId], references: [id])
+  germinationTrialId String?
+  germinationTrial   GerminationTrial? @relation(fields: [germinationTrialId], references: [id])
+  cropId             String
+  varietyId          String
+  variety            CropVariety       @relation(fields: [varietyId], references: [id])
+  stage              NurseryStage      @default(SEED_TRAY)
+  quantity           Int
+  startDate          DateTime          @default(now())
+  expectedReadyDate  DateTime?
+  currentLocation    String?
+  movedToCropCycleId String?
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+}
+
+// =========================================================================
+// Soil & plant health
+// =========================================================================
+
+model SoilTest {
+  id               String    @id @default(uuid())
+  farmId           String
+  plotId           String?
+  plot             Plot?     @relation(fields: [plotId], references: [id])
+  subPlotId        String?
+  sampleLocation   String?
+  date             DateTime  @default(now())
+  nitrogen         Float?
+  phosphorus       Float?
+  potassium        Float?
+  ph               Float?
+  moisture         Float?
+  testMethod       String?
+  testedById       String
+  observations     String?
+  recommendation   String?
+  correctiveAction String?
+  followUpDate     DateTime?
+
+  createdAt DateTime @default(now())
+}
+
+model PlantHealthRecord {
+  id                   String         @id @default(uuid())
+  farmId               String
+  cropCycleId          String
+  cropCycle            CropCycle      @relation(fields: [cropCycleId], references: [id])
+  growthStage          String?
+  symptoms             String?
+  affectedArea         String?
+  severity             IssueSeverity?
+  suspectedCause       String?
+  photoMediaId         String?
+  recommendedTreatment String?
+  organicInputBatchId  String?
+  applicationRate      String?
+  followUpResult       String?
+  recordedById         String
+  date                 DateTime       @default(now())
+
+  pestTreatments PestTreatment[]
+
+  createdAt DateTime @default(now())
+}
+
+model PestTreatment {
+  id                  String             @id @default(uuid())
+  plantHealthRecordId String?
+  plantHealthRecord   PlantHealthRecord? @relation(fields: [plantHealthRecordId], references: [id])
+  cropCycleId         String?
+  cropCycle           CropCycle?         @relation(fields: [cropCycleId], references: [id])
+  scheduleDate        DateTime
+  method              String?
+  inputBatchId        String?
+  status              String             @default("scheduled")
+  completedById       String?
+  completedAt         DateTime?
+
+  createdAt DateTime @default(now())
+}
+
+// =========================================================================
+// Organic input production & usage
+// =========================================================================
+
+model OrganicInputRecipe {
+  id              String  @id @default(uuid())
+  name            String
+  category        String
+  ingredientsJson Json?
+  standardYield   Float?
+  unit            String?
+  notes           String?
+
+  batches OrganicInputBatch[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model OrganicInputBatch {
+  id                     String             @id @default(uuid())
+  farmId                 String
+  recipeId               String
+  recipe                 OrganicInputRecipe @relation(fields: [recipeId], references: [id])
+  batchNumber            String             @unique
+  ingredientsUsedJson    Json?
+  preparationDate        DateTime
+  preparedById           String
+  fermentationPeriodDays Int?
+  availableQuantity      Float
+  unit                   String             @default("litre")
+  expiryDate             DateTime?
+  qualityObservations    String?
+  storageLocationId      String?
+
+  applications InputApplication[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model InputApplication {
+  id            String            @id @default(uuid())
+  farmId        String
+  batchId       String
+  batch         OrganicInputBatch @relation(fields: [batchId], references: [id])
+  targetType    String // plot | cropCycle | animalArea
+  targetId      String
+  quantity      Float
+  unit          String
+  dilutionRatio String?
+  method        String?
+  date          DateTime          @default(now())
+  appliedById   String
+  purpose       String?
+  result        String?
+
+  createdAt DateTime @default(now())
+}
+
+// =========================================================================
+// Inventory, stores, procurement
+// =========================================================================
+
+enum InventoryCategory {
+  SEEDS
+  ORGANIC_INPUTS
+  MANURE
+  CATTLE_FEED
+  POULTRY_FEED
+  PET_FOOD
+  TOOLS
+  SPARE_PARTS
+  PACKAGING
+  KITCHEN_SUPPLIES
+  HARVESTED_PRODUCE
+  VALUE_ADDED_PRODUCTS
+  CLEANING_MATERIALS
+  OTHER_CONSUMABLES
+}
+
+model StockLocation {
+  id         String    @id @default(uuid())
+  farmAreaId String?
+  farmArea   FarmArea? @relation(fields: [farmAreaId], references: [id])
+  name       String
+  type       String?
+  capacity   Float?
+
+  createdAt DateTime @default(now())
+}
+
+model InventoryItem {
+  id            String            @id @default(uuid())
+  farmId        String
+  name          String
+  category      InventoryCategory
+  unit          String
+  minStockLevel Float?
+  trackBatches  Boolean           @default(true)
+  description   String?
+
+  batches InventoryBatch[]
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+}
+
+model InventoryBatch {
+  id                String        @id @default(uuid())
+  itemId            String
+  item              InventoryItem @relation(fields: [itemId], references: [id])
+  batchNumber       String?
+  quantity          Float
+  unit              String
+  expiryDate        DateTime?
+  storageLocationId String?
+  receivedDate      DateTime?
+  costPerUnit       Decimal?      @db.Decimal(12, 2)
+  status            String        @default("active")
+
+  movements StockMovement[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum StockMovementType {
+  PURCHASE_RECEIPT
+  INTERNAL_PRODUCTION
+  ISSUE_TO_TASK
+  TRANSFER
+  RETURN
+  CONSUMPTION
+  DAMAGE
+  SPOILAGE
+  EXPIRY
+  ADJUSTMENT
+  DISPATCH
+}
+
+model StockMovement {
+  id                String            @id @default(uuid())
+  farmId            String
+  itemId            String
+  batchId           String?
+  batch             InventoryBatch?   @relation(fields: [batchId], references: [id])
+  fromLocationId    String?
+  toLocationId      String?
+  quantity          Float
+  unit              String
+  movementType      StockMovementType
+  requestedById     String?
+  issuedById        String?
+  receivedById      String?
+  occurredAt        DateTime          @default(now())
+  relatedTaskId     String?
+  attachmentMediaId String?
+  reason            String?
+  approvedById      String?
+
+  createdAt DateTime @default(now())
+}
+
+model StockCount {
+  id            String   @id @default(uuid())
+  locationId    String
+  countDate     DateTime @default(now())
+  countedById   String
+  varianceNotes String?
+  status        String   @default("draft")
+
+  lines StockCountLine[]
+
+  createdAt DateTime @default(now())
+}
+
+model StockCountLine {
+  id           String     @id @default(uuid())
+  stockCountId String
+  stockCount   StockCount @relation(fields: [stockCountId], references: [id], onDelete: Cascade)
+  itemId       String
+  systemQty    Float
+  countedQty   Float
+  varianceQty  Float
+}
+
+model Vendor {
+  id            String  @id @default(uuid())
+  farmId        String
+  name          String
+  contactPerson String?
+  phone         String?
+  email         String?
+  address       String?
+  category      String?
+  gstin         String?
+  status        String  @default("active")
+
+  purchaseOrders PurchaseOrder[]
+  expenses       Expense[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model PurchaseRequisition {
+  id            String    @id @default(uuid())
+  farmId        String
+  requestedById String
+  farmAreaId    String?
+  neededBy      DateTime?
+  status        String    @default("draft")
+  approvedById  String?
+
+  lines          PurchaseRequisitionLine[]
+  purchaseOrders PurchaseOrder[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model PurchaseRequisitionLine {
+  id            String              @id @default(uuid())
+  requisitionId String
+  requisition   PurchaseRequisition @relation(fields: [requisitionId], references: [id], onDelete: Cascade)
+  itemId        String
+  quantity      Float
+  unit          String
+  notes         String?
+}
+
+model PurchaseOrder {
+  id                   String               @id @default(uuid())
+  farmId               String
+  requisitionId        String?
+  requisition          PurchaseRequisition? @relation(fields: [requisitionId], references: [id])
+  vendorId             String
+  vendor               Vendor               @relation(fields: [vendorId], references: [id])
+  poNumber             String               @unique
+  totalAmount          Decimal?             @db.Decimal(12, 2)
+  status               String               @default("draft")
+  orderedById          String
+  expectedDeliveryDate DateTime?
+
+  lines         PurchaseOrderLine[]
+  goodsReceipts GoodsReceipt[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model PurchaseOrderLine {
+  id              String        @id @default(uuid())
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  itemId          String
+  quantity        Float
+  unit            String
+  unitPrice       Decimal       @db.Decimal(12, 2)
+}
+
+model GoodsReceipt {
+  id              String        @id @default(uuid())
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id])
+  receivedById    String
+  receivedDate    DateTime      @default(now())
+  invoiceRef      String?
+  status          String        @default("received")
+
+  lines GoodsReceiptLine[]
+
+  createdAt DateTime @default(now())
+}
+
+model GoodsReceiptLine {
+  id               String       @id @default(uuid())
+  goodsReceiptId   String
+  goodsReceipt     GoodsReceipt @relation(fields: [goodsReceiptId], references: [id], onDelete: Cascade)
+  itemId           String
+  quantityReceived Float
+  unit             String
+  batchNumber      String?
+}
+
+// =========================================================================
+// Machinery, vehicles, maintenance
+// =========================================================================
+
+enum AssetType {
+  TRACTOR
+  GRASS_CUTTER
+  TROLLEY_CUTTER
+  SPRAYER
+  PUMP
+  PROCESSING_EQUIPMENT
+  REFRIGERATOR
+  COLD_STORAGE
+  DAIRY_EQUIPMENT
+  VEHICLE
+  OTHER
+}
+
+enum AssetStatus {
+  AVAILABLE
+  ASSIGNED
+  IN_USE
+  UNDER_REPAIR
+  AWAITING_PARTS
+  RETIRED
+}
+
+model Asset {
+  id                   String      @id @default(uuid())
+  farmId               String
+  assetCode            String      @unique
+  name                 String
+  type                 AssetType
+  purchaseDate         DateTime?
+  purchaseCost         Decimal?    @db.Decimal(12, 2)
+  currentLocationId    String?
+  assignedToId         String?
+  operationalStatus    AssetStatus @default(AVAILABLE)
+  meterHours           Float?      @default(0)
+  serviceIntervalHours Float?
+  warrantyExpiry       DateTime?
+  documentMediaIds     String[]
+
+  usageLogs           MachineryUsage[]
+  maintenanceRequests MaintenanceRequest[]
+  maintenanceRecords  MaintenanceRecord[]
+  taskLinks           TaskMachinery[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+}
+
+model MachineryUsage {
+  id         String   @id @default(uuid())
+  assetId    String
+  asset      Asset    @relation(fields: [assetId], references: [id])
+  taskId     String?
+  operatorId String
+  date       DateTime @default(now())
+  hoursUsed  Float
+  meterStart Float?
+  meterEnd   Float?
+  fuelUsed   Float?
+  notes      String?
+
+  createdAt DateTime @default(now())
+}
+
+model MaintenanceRequest {
+  id               String       @id @default(uuid())
+  assetId          String
+  asset            Asset        @relation(fields: [assetId], references: [id])
+  reportedById     String
+  issueDescription String
+  priority         TaskPriority @default(MEDIUM)
+  status           String       @default("open")
+  reportedAt       DateTime     @default(now())
+
+  records MaintenanceRecord[]
+}
+
+model MaintenanceRecord {
+  id                   String              @id @default(uuid())
+  assetId              String
+  asset                Asset               @relation(fields: [assetId], references: [id])
+  maintenanceRequestId String?
+  maintenanceRequest   MaintenanceRequest? @relation(fields: [maintenanceRequestId], references: [id])
+  date                 DateTime            @default(now())
+  type                 String // preventive | breakdown
+  description          String?
+  cost                 Decimal?            @db.Decimal(12, 2)
+  partsUsedJson        Json?
+  performedById        String?
+  downtimeHours        Float?
+
+  createdAt DateTime @default(now())
+}
+
+// =========================================================================
+// Harvest & yield
+// =========================================================================
+
+model HarvestForecast {
+  id               String    @id @default(uuid())
+  farmId           String
+  cropCycleId      String
+  cropCycle        CropCycle @relation(fields: [cropCycleId], references: [id])
+  forecastDate     DateTime  @default(now())
+  expectedDate     DateTime
+  expectedGrade    String?
+  expectedQuantity Float
+  unit             String    @default("kg")
+  createdById      String
+
+  createdAt DateTime @default(now())
+}
+
+model HarvestBatch {
+  id                 String           @id @default(uuid())
+  farmId             String
+  batchNumber        String           @unique
+  cropCycleId        String
+  cropCycle          CropCycle        @relation(fields: [cropCycleId], references: [id])
+  cultivationBlockId String
+  cultivationBlock   CultivationBlock @relation(fields: [cultivationBlockId], references: [id])
+  harvestDate        DateTime         @default(now())
+  grossQuantity      Float
+  damagedQuantity    Float            @default(0)
+  netQuantity        Float
+  unit               String           @default("kg")
+  gradeBreakdownJson Json?
+  labourTaskId       String?
+  photoMediaIds      String[]
+  recordedById       String
+  storageLocationId  String?
+  status             String           @default("harvested")
+
+  qualityRecords   HarvestQualityRecord[]
+  dispatchItems    DispatchItem[]
+  productionInputs ProductionBatchInput[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model HarvestQualityRecord {
+  id              String       @id @default(uuid())
+  harvestBatchId  String
+  harvestBatch    HarvestBatch @relation(fields: [harvestBatchId], references: [id])
+  gradedById      String
+  gradeDate       DateTime     @default(now())
+  grade           String
+  notes           String?
+  rejectionReason String?
+
+  createdAt DateTime @default(now())
+}
+
+// =========================================================================
+// Produce distribution & logistics
+// =========================================================================
+
+enum RecipientType {
+  INTERNAL
+  CLIENT
+  FRIENDS_FAMILY
+  PROCESSING
+  EXTERNAL_ORG
+  COURIER
+  DEPARTMENT
+}
+
+model Recipient {
+  id          String        @id @default(uuid())
+  farmId      String
+  name        String
+  type        RecipientType
+  contactInfo String?
+
+  dispatches Dispatch[]
+
+  createdAt DateTime @default(now())
+}
+
+enum DeliveryStatus {
+  PENDING
+  IN_TRANSIT
+  DELIVERED
+  FAILED
+}
+
+model Dispatch {
+  id               String         @id @default(uuid())
+  farmId           String
+  dispatchNumber   String         @unique
+  recipientId      String
+  recipient        Recipient      @relation(fields: [recipientId], references: [id])
+  packingDate      DateTime?
+  dispatchDate     DateTime       @default(now())
+  vehicleOrCourier String?
+  destination      String?
+  preparedById     String
+  approvedById     String?
+  deliveryStatus   DeliveryStatus @default(PENDING)
+  remarks          String?
+
+  items DispatchItem[]
+  pod   ProofOfDelivery?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model DispatchItem {
+  id                String        @id @default(uuid())
+  dispatchId        String
+  dispatch          Dispatch      @relation(fields: [dispatchId], references: [id], onDelete: Cascade)
+  harvestBatchId    String?
+  harvestBatch      HarvestBatch? @relation(fields: [harvestBatchId], references: [id])
+  productionBatchId String?
+  quantity          Float
+  unit              String
+}
+
+model ProofOfDelivery {
+  id               String    @id @default(uuid())
+  dispatchId       String    @unique
+  dispatch         Dispatch  @relation(fields: [dispatchId], references: [id])
+  receivedByName   String?
+  signatureMediaId String?
+  photoMediaId     String?
+  deliveredAt      DateTime?
+  notes            String?
+
+  createdAt DateTime @default(now())
+}
+
+// =========================================================================
+// Dairy & livestock
+// =========================================================================
+
+enum AnimalSpecies {
+  COW
+  BUFFALO
+  GOAT
+  POULTRY
+  OTHER
+}
+
+model Animal {
+  id             String        @id @default(uuid())
+  farmId         String
+  animalTag      String        @unique
+  name           String?
+  species        AnimalSpecies
+  breed          String?
+  sex            String?
+  birthDate      DateTime?
+  parentMaleId   String?
+  parentFemaleId String?
+  healthStatus   String?
+  photoMediaId   String?
+  status         String        @default("active")
+
+  healthRecords   AnimalHealthRecord[]
+  milkCollections MilkCollection[]
+
+  createdById String?
+  createdAt   DateTime  @default(now())
+  updatedById String?
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+}
+
+model AnimalHealthRecord {
+  id            String    @id @default(uuid())
+  animalId      String
+  animal        Animal    @relation(fields: [animalId], references: [id])
+  date          DateTime  @default(now())
+  type          String
+  description   String?
+  performedById String?
+  nextDueDate   DateTime?
+
+  createdAt DateTime @default(now())
+}
+
+enum MilkSession {
+  MORNING
+  EVENING
+}
+
+model MilkCollection {
+  id             String      @id @default(uuid())
+  farmId         String
+  animalId       String
+  animal         Animal      @relation(fields: [animalId], references: [id])
+  date           DateTime    @db.Date
+  session        MilkSession
+  quantityLitres Float
+  collectedById  String
+
+  qualityTest MilkQualityTest?
+
+  createdAt DateTime @default(now())
+
+  @@unique([animalId, date, session])
+}
+
+model MilkQualityTest {
+  id               String         @id @default(uuid())
+  milkCollectionId String         @unique
+  milkCollection   MilkCollection @relation(fields: [milkCollectionId], references: [id])
+  fat              Float?
+  protein          Float?
+  lactose          Float?
+  snf              Float?
+  testedAt         DateTime       @default(now())
+  testedById       String
+  abnormality      String?
+  correctiveAction String?
+}
+
+// =========================================================================
+// Value-added processing
+// =========================================================================
+
+model ProductionBatch {
+  id                        String    @id @default(uuid())
+  farmId                    String
+  batchNumber               String    @unique
+  productName               String
+  productionDate            DateTime  @default(now())
+  rawQuantity               Float?
+  finishedQuantity          Float?
+  wasteQuantity             Float?
+  processingDurationMinutes Int?
+  staffIds                  String[]
+  equipmentAssetId          String?
+  qualityResult             String?
+  packingDetails            String?
+  storageLocationId         String?
+  expiryDate                DateTime?
+
+  inputs  ProductionBatchInput[]
+  outputs ProductionBatchOutput[]
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+}
+
+model ProductionBatchInput {
+  id                String          @id @default(uuid())
+  productionBatchId String
+  productionBatch   ProductionBatch @relation(fields: [productionBatchId], references: [id], onDelete: Cascade)
+  sourceType        String // harvestBatch | inventoryBatch | organicInputBatch
+  sourceId          String?
+  harvestBatchId    String?
+  harvestBatch      HarvestBatch?   @relation(fields: [harvestBatchId], references: [id])
+  quantity          Float
+  unit              String
+}
+
+model ProductionBatchOutput {
+  id                String          @id @default(uuid())
+  productionBatchId String
+  productionBatch   ProductionBatch @relation(fields: [productionBatchId], references: [id], onDelete: Cascade)
+  productName       String
+  quantity          Float
+  unit              String
+  storageLocationId String?
+}
+
+// =========================================================================
+// R&D and crop trials
+// =========================================================================
+
+enum TrialOutcome {
+  CONTINUE
+  MODIFY
+  SCALE
+  COMMERCIALIZE
+  DISCONTINUE
+}
+
+model RAndDTrial {
+  id                  String            @id @default(uuid())
+  farmId              String
+  trialCode           String            @unique
+  objective           String
+  cropId              String
+  crop                Crop              @relation(fields: [cropId], references: [id])
+  varietyId           String?
+  variety             CropVariety?      @relation(fields: [varietyId], references: [id])
+  hypothesis          String?
+  cultivationBlockId  String?
+  cultivationBlock    CultivationBlock? @relation(fields: [cultivationBlockId], references: [id])
+  startDate           DateTime
+  endDate             DateTime?
+  methodology         String?
+  inputProtocol       String?
+  observationSchedule String?
+  yieldResult         Float?
+  qualityResult       String?
+  cost                Decimal?          @db.Decimal(12, 2)
+  outcome             TrialOutcome?
+  recommendation      String?
+  status              String            @default("active")
+
+  observations TrialObservation[]
+
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedById String?
+  updatedAt   DateTime @updatedAt
+}
+
+model TrialObservation {
+  id               String     @id @default(uuid())
+  trialId          String
+  trial            RAndDTrial @relation(fields: [trialId], references: [id])
+  date             DateTime   @default(now())
+  measurementsJson Json?
+  photoMediaIds    String[]
+  observedById     String
+  notes            String?
+
+  createdAt DateTime @default(now())
+}
+
+// =========================================================================
+// Expenses & petty cash
+// =========================================================================
+
+enum FinanceStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  REIMBURSED
+}
+
+model Expense {
+  id                     String        @id @default(uuid())
+  farmId                 String
+  expenseNumber          String        @unique
+  date                   DateTime      @default(now())
+  category               String
+  department             String?
+  vendorId               String?
+  vendor                 Vendor?       @relation(fields: [vendorId], references: [id])
+  amount                 Decimal       @db.Decimal(12, 2)
+  tax                    Decimal?      @db.Decimal(12, 2)
+  paymentMethod          String?
+  relatedTaskId          String?
+  relatedPurchaseOrderId String?
+  receiptMediaId         String?
+  submittedById          String
+  approvedById           String?
+  financeStatus          FinanceStatus @default(PENDING)
+
+  pettyCashTransactions PettyCashTransaction[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model PettyCashTransaction {
+  id               String   @id @default(uuid())
+  farmId           String
+  date             DateTime @default(now())
+  type             String // opening | expense | reimbursement | closing
+  amount           Decimal  @db.Decimal(12, 2)
+  relatedExpenseId String?
+  relatedExpense   Expense? @relation(fields: [relatedExpenseId], references: [id])
+  balanceAfter     Decimal  @db.Decimal(12, 2)
+  recordedById     String
+  approvedById     String?
+
+  createdAt DateTime @default(now())
+}
+
+// =========================================================================
+// Media, communication, meetings
+// =========================================================================
+
+model MediaFile {
+  id           String    @id @default(uuid())
+  farmId       String?
+  url          String
+  thumbnailUrl String?
+  mimeType     String
+  sizeBytes    Int?
+  uploadedById String
+  uploadedAt   DateTime  @default(now())
+  entityType   String?
+  entityId     String?
+  caption      String?
+  gpsLat       Float?
+  gpsLng       Float?
+  capturedAt   DateTime?
+
+  @@index([entityType, entityId])
+}
+
+model Comment {
+  id              String   @id @default(uuid())
+  entityType      String
+  entityId        String
+  taskId          String?
+  task            Task?    @relation(fields: [taskId], references: [id])
+  authorId        String
+  body            String
+  mentionsUserIds String[]
+  createdAt       DateTime @default(now())
+
+  @@index([entityType, entityId])
+}
+
+enum NotificationChannel {
+  IN_APP
+  PUSH
+  EMAIL
+  WHATSAPP
+}
+
+model Notification {
+  id         String              @id @default(uuid())
+  userId     String
+  type       String
+  title      String
+  body       String?
+  entityType String?
+  entityId   String?
+  isRead     Boolean             @default(false)
+  channel    NotificationChannel @default(IN_APP)
+  createdAt  DateTime            @default(now())
+
+  @@index([userId, isRead])
+}
+
+model Approval {
+  id            String    @id @default(uuid())
+  entityType    String
+  entityId      String
+  requestedById String
+  approverRole  String?
+  approverId    String?
+  status        String    @default("pending")
+  comments      String?
+  decidedAt     DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([entityType, entityId])
+}
+
+model MeetingRecord {
+  id             String   @id @default(uuid())
+  farmId         String
+  title          String
+  date           DateTime @default(now())
+  attendeeIds    String[]
+  notes          String?
+  minutesMediaId String?
+
+  actionItems ActionItem[]
+
+  createdAt DateTime @default(now())
+}
+
+model ActionItem {
+  id              String         @id @default(uuid())
+  meetingRecordId String?
+  meetingRecord   MeetingRecord? @relation(fields: [meetingRecordId], references: [id])
+  description     String
+  assignedToId    String
+  dueDate         DateTime?
+  status          String         @default("open")
+  resolvedAt      DateTime?
+
+  createdAt DateTime @default(now())
+}

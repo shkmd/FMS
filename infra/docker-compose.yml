@@ -1,0 +1,53 @@
+name: athachi-fms
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: fms
+      POSTGRES_PASSWORD: fms_dev_password
+      POSTGRES_DB: fms
+    ports:
+      - "55432:5432"
+    volumes:
+      - fms_postgres_data:/var/lib/postgresql/data
+      - ./init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fms -d fms"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: fms_minio
+      MINIO_ROOT_PASSWORD: fms_minio_password
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - fms_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  fms_postgres_data:
+  fms_minio_data:
