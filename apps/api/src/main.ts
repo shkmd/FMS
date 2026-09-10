@@ -30,7 +30,9 @@ async function bootstrap() {
   const document = SwaggerModule.createDocument(app, config);
   SwaggerModule.setup("api/docs", app, document);
 
-  const port = process.env.API_PORT ? Number(process.env.API_PORT) : 4000;
+  // Railway (and most PaaS hosts) inject PORT and expect the app to bind to it; API_PORT stays as
+  // the local-dev override since docker-compose/.env.example predate this.
+  const port = Number(process.env.PORT ?? process.env.API_PORT ?? 4000);
   await app.listen(port);
   // eslint-disable-next-line no-console
   console.log(`Athachi Farms FMS API listening on http://localhost:${port}/api (docs at /api/docs)`);

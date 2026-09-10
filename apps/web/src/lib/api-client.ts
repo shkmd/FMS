@@ -1,4 +1,5 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000/api";
+// `||` (not `??`) so a build that forwarded an empty string for this env var also falls back.
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000/api";
 
 const TOKEN_KEY = "fms_access_token";
 

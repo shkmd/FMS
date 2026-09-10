@@ -16,6 +16,10 @@ COPY packages/shared packages/shared
 COPY apps/web apps/web
 WORKDIR /repo/apps/web
 ENV NEXT_TELEMETRY_DISABLED=1
+# NEXT_PUBLIC_* vars are inlined into the client bundle at build time, so they must arrive as a
+# build arg (Railway forwards configured service variables as build args automatically).
+ARG NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 RUN pnpm build
 
 FROM node:20-alpine AS runner

@@ -15,6 +15,10 @@ COPY --from=deps /repo/apps/api/node_modules ./apps/api/node_modules
 COPY packages/shared packages/shared
 COPY apps/api apps/api
 WORKDIR /repo/apps/api
+# `prisma generate` only reads the schema (no DB connection), but Prisma still requires
+# DATABASE_URL to resolve to a non-empty string — the placeholder is never actually connected to.
+ARG DATABASE_URL="postgresql://user:password@localhost:5432/db"
+ENV DATABASE_URL=$DATABASE_URL
 RUN pnpm prisma generate
 RUN pnpm build
 
@@ -30,4 +34,4 @@ COPY --from=build /repo/apps/api/prisma ./apps/api/prisma
 COPY --from=build /repo/apps/api/package.json ./apps/api/package.json
 WORKDIR /repo/apps/api
 EXPOSE 4000
-CMD ["node", "dist/main.js"]
+CMD ["node", "dist/src/main.js"]
