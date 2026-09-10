@@ -27,7 +27,6 @@ ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 RUN pnpm build
 
 FROM node:20-alpine AS runner
-RUN corepack enable
 WORKDIR /repo/apps/web
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
@@ -36,4 +35,6 @@ COPY --from=build /repo/apps/web/.next ./.next
 COPY --from=build /repo/apps/web/node_modules ./node_modules
 COPY --from=build /repo/apps/web/package.json ./package.json
 EXPOSE 3000
-CMD ["pnpm", "start"]
+# Runs `next start` directly (no pnpm) — the runner has no pnpm-workspace.yaml, and everything
+# `pnpm start` would do (resolve the script, invoke the local `next` binary) is already resolved.
+CMD ./node_modules/.bin/next start -p ${PORT:-3000}
